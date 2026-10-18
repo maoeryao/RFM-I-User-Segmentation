@@ -10,16 +10,18 @@ df.columns = [c.strip() for c in df.columns]
 # 剔除关键字段缺失的数据
 df = df.dropna(subset=['Income', 'Average_Order_Value', 'Total_Spending', 'Last_Login_Days_Ago'])
 
-# 定义流失标签：距离上次登录 > 30 天
-# 修改后的代码（贴合数据集实际情况）
+# 定义流失标签：结合该数据集实际最大未登录天数（29天），将阈值定为 >= 15 天
 df['is_churned'] = (df['Last_Login_Days_Ago'] >= 15).astype(int)
 
 
 # ================= 2. 辅助函数：Min-Max 归一化 =================
 def min_max_normalize(series, reverse=False):
     min_val, max_val = series.min(), series.max()
+    
+    # 边界保护：如果最大值等于最小值，说明没有波动，统一给 50 分
     if max_val == min_val:
         return pd.Series([50.0] * len(series))
+        
     if reverse:  # 越小越好（如R值，未登录天数越少越好）
         return ((max_val - series) / (max_val - min_val)) * 100
     return ((series - min_val) / (max_val - min_val)) * 100  # 越大越好（如F、M值）
@@ -31,19 +33,20 @@ df['R_Score'] = min_max_normalize(df['Last_Login_Days_Ago'], reverse=True)
 df['F_Score'] = min_max_normalize(df['Purchase_Frequency'])
 df['M_Score'] = min_max_normalize(df['Total_Spending'])
 
-# 传统 RFM 总分 (经验权重 2:3:5)
+# 传统 RFM 总分 (经验权重 2:3:5，由于消费金额(M)最能代表价值，给予最高权重)
 df['Traditional_RFM_Score'] = 0.2 * df['R_Score'] + 0.3 * df['F_Score'] + 0.5 * df['M_Score']
+
 
 # ================= 4. 增量优化：意向度 (I-Score) =================
 print("✨ 正在计算增量指标：意向度 I-Score...")
-# 逻辑：浏览时长*.5 + 浏览页数*.5，旨在衡量用户的购买意向
+# 逻辑：浏览时长(50%) + 浏览页数(50%)，旨在衡量用户的购买意向
 df['Time_Norm'] = min_max_normalize(df['Time_Spent_on_Site_Minutes'])
 df['Page_Norm'] = min_max_normalize(df['Pages_Viewed'])
 df['I_Score'] = 0.5 * df['Time_Norm'] + 0.5 * df['Page_Norm']
 
+
 # ================= 5. 增量优化：活跃连接度 (A-Score) =================
 print("🔗 正在计算增量指标：活跃连接度 A-Score...")
-
 
 def calc_active_connection(row):
     days_ago = row['Last_Login_Days_Ago']
@@ -59,31 +62,31 @@ def calc_active_connection(row):
     else:
         return 1
 
-
 df['A_Score'] = df.apply(calc_active_connection, axis=1)
 # 将A_Score映射到 0-100 分区间，方便加权
 df['A_Score_Normalized'] = (df['A_Score'] / 3) * 100
 
+
 # ================= 6. 构建 RFM-I 综合模型 =================
 print("🚀 正在构建最终 RFM-I 模型...")
-# 最终得分公式：基础RFM(60%) + 意向度(25%) + 活跃连接度(15%)
+# 最终得分公式：基础RFM(权重60%) + 意向度(权重25%) + 活跃连接度(权重15%)
 df['RFM_I_Score'] = 0.6 * df['Traditional_RFM_Score'] + 0.25 * df['I_Score'] + 0.15 * df['A_Score_Normalized']
+
 
 # ================= 7. 业务分层洞察 =================
 print("\n" + "=" * 50)
 print("💡 RFM-I 业务分层洞察（发现传统模型看不见的群体）")
 print("=" * 50)
 
-
 # 定义业务标签：纠结土豪（高意向、低消费），高潜流失客（高消费、近期流失）
 def segment_user(row):
+    # 阈值说明：I>60视为高意向，M<50视为低消费，R<40视为流失风险高，M>60视为高消费
     if row['I_Score'] > 60 and row['M_Score'] < 50:
         return '纠结土豪 (高潜)'
     elif row['R_Score'] < 40 and row['M_Score'] > 60:
         return '高潜流失客 (紧急召回)'
     else:
         return '一般用户/其他'
-
 
 df['User_Segment'] = df.apply(segment_user, axis=1)
 
@@ -94,8 +97,10 @@ segment_summary = df.groupby('User_Segment').agg(
     平均意向分=('I_Score', 'mean'),
     平均活跃度=('A_Score', 'mean')
 ).round(1)
+
 print(segment_summary)
 print("👉 洞察：传统模型会把'纠结土豪'误判为低价值（因为当前M低），但他们意向极高，只需一张券就能转化！")
+
 
 # ================= 8. A/B 实验设计与 ROI 计算 =================
 print("\n" + "=" * 50)
@@ -104,6 +109,11 @@ print("=" * 50)
 
 # 筛选流失用户进行实验
 churn_df = df[df['is_churned'] == 1].copy()
+
+# ⚠️ 边界保护：防止数据集中没有流失用户导致后续除零报错
+if churn_df.empty:
+    print("⚠️ 当前数据集中没有符合定义的流失用户，请调整 is_churned 的阈值。")
+    exit()
 
 # 策略 A（对照组）：用传统模型圈 Top 20%
 threshold_A = churn_df['Traditional_RFM_Score'].quantile(0.8)
@@ -121,25 +131,24 @@ group_A['recalled'] = np.random.choice([0, 1], size=len(group_A), p=[0.85, 0.15]
 group_B['recalled'] = np.random.choice([0, 1], size=len(group_B), p=[0.78, 0.22])
 
 # 业务财务指标设定
-cost_per_user = 10  # 假设每人营销成本(短信+发券成本) 10元
+cost_per_user = 10    # 假设每人营销成本(短信+发券成本) 10元
 profit_per_user = 60  # 假设成功召回一个用户的平均利润 60元
 
 # --- A组 ROI ---
 recall_A = group_A['recalled'].sum()
 cost_A = len(group_A) * cost_per_user
 revenue_A = recall_A * profit_per_user
-roi_A = ((revenue_A - cost_A) / cost_A) * 100
+roi_A = ((revenue_A - cost_A) / cost_A) * 100 if cost_A > 0 else 0
 
 # --- B组 ROI ---
 recall_B = group_B['recalled'].sum()
 cost_B = len(group_B) * cost_per_user
 revenue_B = recall_B * profit_per_user
-roi_B = ((revenue_B - cost_B) / cost_B) * 100
+roi_B = ((revenue_B - cost_B) / cost_B) * 100 if cost_B > 0 else 0
 
-print(
-    f"方案A (传统RFM): 触达 {len(group_A)}人 | 召回 {recall_A}人 | 成本 {cost_A}元 | 边际收益 {revenue_A}元 | 边际ROI: {roi_A:.1f}%")
-print(
-    f"方案B (RFM-I) : 触达 {len(group_B)}人 | 召回 {recall_B}人 | 成本 {cost_B}元 | 边际收益 {revenue_B}元 | 边际ROI: {roi_B:.1f}%")
+print(f"方案A (传统RFM): 触达 {len(group_A)}人 | 召回 {recall_A}人 | 成本 {cost_A}元 | 边际收益 {revenue_A}元 | 边际ROI: {roi_A:.1f}%")
+print(f"方案B (RFM-I) : 触达 {len(group_B)}人 | 召回 {recall_B}人 | 成本 {cost_B}元 | 边际收益 {revenue_B}元 | 边际ROI: {roi_B:.1f}%")
+
 
 # ================= 9. 卡方检验验证显著性 =================
 print("\n" + "=" * 50)
